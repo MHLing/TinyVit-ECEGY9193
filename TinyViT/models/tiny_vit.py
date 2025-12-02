@@ -137,9 +137,24 @@ class PatchMerging(nn.Module):
     def forward(self, x):
         if x.ndim == 3:
             H, W = self.input_resolution
-            B = len(x)
+            B, L, C = x.shape
+            
+            # Handle case where input has been pruned (L != H * W)
+            if L != H * W:
+                # Adjust H, W to match actual token count
+                aspect_ratio = H / W if W > 0 else 1.0
+                new_H = max(1, int((L * aspect_ratio) ** 0.5))
+                new_W = L // new_H
+                while new_H * new_W < L and new_H < L:
+                    new_H += 1
+                    new_W = L // new_H
+                if new_H * new_W != L:
+                    new_H = int(L ** 0.5)
+                    new_W = (L + new_H - 1) // new_H
+                H, W = new_H, new_W
+            
             # (B, C, H, W)
-            x = x.view(B, H, W, -1).permute(0, 3, 1, 2)
+            x = x.view(B, H, W, C).permute(0, 3, 1, 2)
 
         x = self.conv1(x)
         x = self.act(x)
@@ -217,6 +232,7 @@ class Attention(torch.nn.Module):
     def __init__(self, dim, key_dim, num_heads=8,
                  attn_ratio=4,
                  resolution=(14, 14),
+                 return_attention=False,
                  ):
         super().__init__()
         # (h, w)
@@ -229,6 +245,7 @@ class Attention(torch.nn.Module):
         self.dh = int(attn_ratio * key_dim) * num_heads
         self.attn_ratio = attn_ratio
         h = self.dh + nh_kd * 2
+        self.return_attention = return_attention
 
         self.norm = nn.LayerNorm(dim)
         self.qkv = nn.Linear(dim, h)
@@ -259,8 +276,9 @@ class Attention(torch.nn.Module):
         else:
             self.ab = self.attention_biases[:, self.attention_bias_idxs]
 
-    def forward(self, x):  # x (B,N,C)
+    def forward(self, x, return_attention=None):  # x (B,N,C)
         B, N, _ = x.shape
+        return_attention = return_attention if return_attention is not None else self.return_attention
 
         # Normalization
         x = self.norm(x)
@@ -283,6 +301,9 @@ class Attention(torch.nn.Module):
         attn = attn.softmax(dim=-1)
         x = (attn @ v).transpose(1, 2).reshape(B, N, self.dh)
         x = self.proj(x)
+        
+        if return_attention:
+            return x, attn
         return x
 
 
@@ -300,12 +321,16 @@ class TinyViTBlock(nn.Module):
         local_conv_size (int): the kernel size of the convolution between
                                Attention and MLP. Default: 3
         activation: the activation function. Default: nn.GELU
+        token_pruning_ratio (float): Ratio of tokens to prune. Default: 0.0 (no pruning)
+        token_pruning_method (str): Method for token pruning. Options: 'attention', 'magnitude'. Default: 'attention'
     """
 
     def __init__(self, dim, input_resolution, num_heads, window_size=7,
                  mlp_ratio=4., drop=0., drop_path=0.,
                  local_conv_size=3,
                  activation=nn.GELU,
+                 token_pruning_ratio=0.0,
+                 token_pruning_method='attention',
                  ):
         super().__init__()
         self.dim = dim
@@ -314,6 +339,8 @@ class TinyViTBlock(nn.Module):
         assert window_size > 0, 'window_size must be greater than 0'
         self.window_size = window_size
         self.mlp_ratio = mlp_ratio
+        self.token_pruning_ratio = token_pruning_ratio
+        self.token_pruning_method = token_pruning_method
 
         self.drop_path = DropPath(
             drop_path) if drop_path > 0. else nn.Identity()
@@ -323,7 +350,8 @@ class TinyViTBlock(nn.Module):
 
         window_resolution = (window_size, window_size)
         self.attn = Attention(dim, head_dim, num_heads,
-                              attn_ratio=1, resolution=window_resolution)
+                              attn_ratio=1, resolution=window_resolution,
+                              return_attention=(token_pruning_ratio > 0 and token_pruning_method == 'attention'))
 
         mlp_hidden_dim = int(dim * mlp_ratio)
         mlp_activation = activation
@@ -333,15 +361,119 @@ class TinyViTBlock(nn.Module):
         pad = local_conv_size // 2
         self.local_conv = Conv2d_BN(
             dim, dim, ks=local_conv_size, stride=1, pad=pad, groups=dim)
+    
+    def compute_token_importance(self, x, attn=None):
+        """Compute token importance scores for pruning."""
+        B, N, C = x.shape
+        
+        if self.token_pruning_method == 'attention' and attn is not None:
+            # Use attention scores: importance = sum of attention received by each token
+            # attn shape should be (B, num_heads, N, N) or compatible
+            try:
+                if attn.dim() == 4:
+                    # Standard case: (B, num_heads, N, N)
+                    attn_N = attn.shape[-1]  # Number of tokens in attention
+                    if attn_N == N:
+                        # For each token, sum the attention it receives from all other tokens
+                        importance = attn.sum(dim=1).sum(dim=1)  # (B, N) - total attention received
+                        # Normalize by number of tokens to get average
+                        importance = importance / N
+                    else:
+                        # Shape mismatch, fallback to magnitude
+                        importance = torch.norm(x, p=2, dim=-1)
+                else:
+                    # Unexpected attention shape, fallback to magnitude
+                    importance = torch.norm(x, p=2, dim=-1)
+            except Exception:
+                # Any error, fallback to magnitude
+                importance = torch.norm(x, p=2, dim=-1)
+        elif self.token_pruning_method == 'magnitude':
+            # Use feature magnitude: importance = L2 norm of token features
+            importance = torch.norm(x, p=2, dim=-1)  # (B, N)
+        else:
+            # Default: use magnitude if attention not available
+            importance = torch.norm(x, p=2, dim=-1)  # (B, N)
+        
+        # Ensure importance has correct shape
+        if importance.shape != (B, N):
+            # Fallback to magnitude if shape doesn't match
+            importance = torch.norm(x, p=2, dim=-1)
+        
+        return importance
+    
+    def prune_tokens(self, x, importance, keep_indices=None):
+        """Prune tokens based on importance scores."""
+        if self.token_pruning_ratio <= 0 or keep_indices is not None:
+            if keep_indices is not None:
+                # Use provided indices
+                B = x.shape[0]
+                pruned_x = torch.gather(x, 1, keep_indices.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+                return pruned_x, keep_indices
+            return x, None
+        
+        B, N, C = x.shape
+        
+        # Ensure importance has the correct shape
+        if importance.shape != (B, N):
+            # If importance shape doesn't match, try to fix it
+            if importance.dim() == 2 and importance.shape[0] == B:
+                # Take first N elements if importance has more tokens
+                if importance.shape[1] > N:
+                    importance = importance[:, :N]
+                # Pad if importance has fewer tokens
+                elif importance.shape[1] < N:
+                    padding = torch.zeros(B, N - importance.shape[1], device=importance.device, dtype=importance.dtype)
+                    importance = torch.cat([importance, padding], dim=1)
+            else:
+                # Fallback: use magnitude
+                importance = torch.norm(x, p=2, dim=-1)
+        
+        num_tokens_to_keep = max(1, int(N * (1 - self.token_pruning_ratio)))
+        # Ensure we don't try to keep more tokens than available
+        num_tokens_to_keep = min(num_tokens_to_keep, N)
+        
+        # Get top-k important tokens
+        _, top_indices = torch.topk(importance, num_tokens_to_keep, dim=1)  # (B, num_tokens_to_keep)
+        top_indices, _ = torch.sort(top_indices, dim=1)  # Sort to maintain spatial order
+        
+        # Gather pruned tokens
+        pruned_x = torch.gather(x, 1, top_indices.unsqueeze(-1).expand(-1, -1, C))
+        
+        return pruned_x, top_indices
 
-    def forward(self, x):
+    def forward(self, x, keep_indices=None):
         H, W = self.input_resolution
         B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
+        
+        # Handle case where input has been pruned (L != H * W)
+        if L != H * W:
+            # Adjust H, W to match actual token count
+            # Try to maintain aspect ratio
+            aspect_ratio = H / W if W > 0 else 1.0
+            new_H = max(1, int((L * aspect_ratio) ** 0.5))
+            new_W = L // new_H
+            # Ensure new_H * new_W == L
+            while new_H * new_W < L and new_H < L:
+                new_H += 1
+                new_W = L // new_H
+            if new_H * new_W != L:
+                # Fallback: use square-like shape
+                new_H = int(L ** 0.5)
+                new_W = (L + new_H - 1) // new_H
+            H, W = new_H, new_W
+        
         res_x = x
+        
+        # Attention forward pass
         if H == self.window_size and W == self.window_size:
-            x = self.attn(x)
+            # Non-windowed attention (exact match)
+            if self.token_pruning_ratio > 0 and self.token_pruning_method == 'attention':
+                x, attn = self.attn(x, return_attention=True)
+            else:
+                x = self.attn(x)
+                attn = None
         else:
+            # Windowed attention
             x = x.view(B, H, W, C)
             pad_b = (self.window_size - H %
                      self.window_size) % self.window_size
@@ -359,7 +491,14 @@ class TinyViTBlock(nn.Module):
             x = x.view(B, nH, self.window_size, nW, self.window_size, C).transpose(2, 3).reshape(
                 B * nH * nW, self.window_size * self.window_size, C
             )
-            x = self.attn(x)
+            attn_result = self.attn(x)
+            # Handle both tuple (x, attn) and single tensor return
+            if isinstance(attn_result, tuple):
+                x, attn = attn_result
+            else:
+                x = attn_result
+                attn = None  # Window attention doesn't easily support attention-based pruning
+            
             # window reverse
             x = x.view(B, nH, nW, self.window_size, self.window_size,
                        C).transpose(2, 3).reshape(B, pH, pW, C)
@@ -367,13 +506,54 @@ class TinyViTBlock(nn.Module):
             if padding:
                 x = x[:, :H, :W].contiguous()
 
-            x = x.view(B, L, C)
+            x = x.view(B, H * W, C)
+            L = H * W
 
+        # Residual connection
         x = res_x + self.drop_path(x)
 
-        x = x.transpose(1, 2).reshape(B, C, H, W)
-        x = self.local_conv(x)
-        x = x.view(B, C, L).transpose(1, 2)
+        # Token pruning after attention (works for both attention and magnitude methods)
+        if self.token_pruning_ratio > 0:
+            # Compute importance
+            if self.token_pruning_method == 'attention' and attn is not None:
+                importance = self.compute_token_importance(x, attn)
+            else:
+                # Use magnitude method (fallback for windowed attention or when attention not available)
+                importance = self.compute_token_importance(x)
+            
+            # Prune tokens
+            x, keep_indices = self.prune_tokens(x, importance, keep_indices)
+            L = x.shape[1]
+            
+            # Update spatial dimensions for local conv
+            aspect_ratio = H / W if W > 0 else 1.0
+            new_H = max(1, int((L * aspect_ratio) ** 0.5))
+            new_W = L // new_H
+            while new_H * new_W < L and new_H < L:
+                new_H += 1
+                new_W = L // new_H
+            if new_H * new_W != L:
+                new_H = int(L ** 0.5)
+                new_W = (L + new_H - 1) // new_H
+            H, W = new_H, new_W
+        
+        # Reshape for local conv
+        if L == H * W:
+            x = x.transpose(1, 2).reshape(B, C, H, W)
+            x = self.local_conv(x)
+            x = x.view(B, C, L).transpose(1, 2)
+        else:
+            # Handle dimension mismatch - pad or truncate to match H*W
+            target_L = H * W
+            if L < target_L:
+                padding = torch.zeros(B, target_L - L, C, device=x.device, dtype=x.dtype)
+                x = torch.cat([x, padding], dim=1)
+            elif L > target_L:
+                x = x[:, :target_L, :]
+            x = x.transpose(1, 2).reshape(B, C, H, W)
+            x = self.local_conv(x)
+            x = x.view(B, C, H * W).transpose(1, 2)
+            L = H * W
 
         x = x + self.drop_path(self.mlp(x))
         return x
@@ -408,6 +588,9 @@ class BasicLayer(nn.Module):
                  local_conv_size=3,
                  activation=nn.GELU,
                  out_dim=None,
+                 token_pruning_ratio=0.0,
+                 token_pruning_method='attention',
+                 prune_first_block_only=False,
                  ):
 
         super().__init__()
@@ -417,17 +600,28 @@ class BasicLayer(nn.Module):
         self.use_checkpoint = use_checkpoint
 
         # build blocks
-        self.blocks = nn.ModuleList([
-            TinyViTBlock(dim=dim, input_resolution=input_resolution,
-                         num_heads=num_heads, window_size=window_size,
-                         mlp_ratio=mlp_ratio,
-                         drop=drop,
-                         drop_path=drop_path[i] if isinstance(
-                             drop_path, list) else drop_path,
-                         local_conv_size=local_conv_size,
-                         activation=activation,
-                         )
-            for i in range(depth)])
+        self.blocks = nn.ModuleList()
+        for i in range(depth):
+            # 如果只在第一个 block prune，那么 i==0 用 ratio，其它 i>0 强制 0
+            if prune_first_block_only and i > 0:
+                block_prune_ratio = 0.0
+            else:
+                block_prune_ratio = token_pruning_ratio
+
+            blk = TinyViTBlock(
+                dim=dim,
+                input_resolution=input_resolution,
+                num_heads=num_heads,
+                window_size=window_size,
+                mlp_ratio=mlp_ratio,
+                drop=drop,
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                local_conv_size=local_conv_size,
+                activation=activation,
+                token_pruning_ratio=block_prune_ratio,   # ★ 每个 block 自己的 ratio
+                token_pruning_method=token_pruning_method,
+            )
+            self.blocks.append(blk)
 
         # patch merging layer
         if downsample is not None:
@@ -462,6 +656,8 @@ class TinyViT(nn.Module):
                  mbconv_expand_ratio=4.0,
                  local_conv_size=3,
                  layer_lr_decay=1.0,
+                 token_pruning_ratio=0.0,
+                 token_pruning_method='attention',
                  ):
         super().__init__()
 
@@ -505,12 +701,25 @@ class TinyViT(nn.Module):
                     **kwargs,
                 )
             else:
+                # Only enable token pruning in Stage 3 (i_layer == 2).
+                # Other stages get token_pruning_ratio = 0.0 to avoid
+                # breaking window attention or pruning when token count is small.
+                if i_layer == 2:
+                    stage_token_pruning_ratio = token_pruning_ratio
+                    prune_first_block_only = True
+                else:
+                    # Stage2 & Stage4：完全不 prune
+                    stage_token_pruning_ratio = 0.0
+                    prune_first_block_only = False
                 layer = BasicLayer(
                     num_heads=num_heads[i_layer],
                     window_size=window_sizes[i_layer],
                     mlp_ratio=self.mlp_ratio,
                     drop=drop_rate,
                     local_conv_size=local_conv_size,
+                    token_pruning_ratio=stage_token_pruning_ratio,
+                    token_pruning_method=token_pruning_method,
+                    prune_first_block_only=prune_first_block_only,
                     **kwargs)
             self.layers.append(layer)
 
