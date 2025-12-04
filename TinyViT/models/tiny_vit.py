@@ -793,8 +793,45 @@ class TinyViT(nn.Module):
 
         return x
 
+    def forward_features_profile(self, x):
+        import time
+        # x: (N, C, H, W)
+
+        # reset block timing list
+        self.block_times = []
+        # patch embedding (optional to time)
+        x = self.patch_embed(x)
+
+        # measure layer 0
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        x = self.layers[0](x)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        # measure remaining layers
+        start_i = 1
+        for i in range(start_i, len(self.layers)):
+            layer = self.layers[i]
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
+            x = layer(x)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
+            if isinstance(layer, BasicLayer):
+                self.block_times.append(layer.test_time)  # time for block i
+
+        # global pooling
+        x = x.mean(1)
+
+        return x
+
     def forward(self, x):
         x = self.forward_features(x)
+        # x = self.forward_features_profile(x)
         x = self.norm_head(x)
         x = self.head(x)
         return x
@@ -858,6 +895,17 @@ def tiny_vit_5m_224(pretrained=False, **kwargs):
     model_kwargs.update(kwargs)
     return _create_tiny_vit('tiny_vit_5m_224', pretrained, **model_kwargs)
 
+@register_model
+def tiny_vit_small(pretrained=False, **kwargs):
+    model_kwargs = dict(
+        embed_dims=[64, 128, 160, 320],
+        depths=[2, 2, 2, 2],
+        num_heads=[2, 4, 5, 10],
+        window_sizes=[7, 7, 14, 7],
+        drop_path_rate=0.0,
+    )
+    model_kwargs.update(kwargs)
+    return TinyViT(**model_kwargs)
 
 @register_model
 def tiny_vit_11m_224(pretrained=False, **kwargs):
