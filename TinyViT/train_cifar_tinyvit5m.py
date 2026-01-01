@@ -1,10 +1,11 @@
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 from datasets import load_dataset
 
-from models.tiny_vit import tiny_vit_5m_224  # TinyViT-5M 构造函数
+from models.tiny_vit import tiny_vit_5m_224, ViTSmallBaseline  # TinyViT-5M 构造函数
 
 class HFCIFAR100(Dataset):
     """Wrap HuggingFace CIFAR-100 dataset to work with PyTorch + torchvision transforms."""
@@ -136,7 +137,6 @@ def evaluate(model, loader, criterion, device, epoch):
 
 def main():
     # ===== 基本配置 =====
-    data_root = r"C:\Users\lmh98\Desktop\CV Project\data\cifar-100-python"   # 数据会下在 TinyViT/cifar100_data 下面
     batch_size = 128
     epochs = 50                     # 先跑 50 个 epoch 看看情况
     lr = 1e-3
@@ -149,7 +149,8 @@ def main():
 
     # ===== 构建 TinyViT-5M 模型 =====
     # num_classes=100 对应 CIFAR-100
-    model = tiny_vit_5m_224(pretrained=True, num_classes=100)
+    model = ViTSmallBaseline()
+    # model = tiny_vit_5m_224(pretrained=True, num_classes=100)
     model.to(device)
 
     # ===== 损失函数 & 优化器 =====
@@ -165,7 +166,7 @@ def main():
         # 简单保存最好 ckpt
         if val_acc > best_acc:
             best_acc = val_acc
-            torch.save(model.state_dict(), "tinyvit5m_cifar100_best.pth")
+            torch.save(model.state_dict(), "smallvit5m_cifar100_best.pth")
             print(f"*** New best acc: {best_acc:.2f}%, checkpoint saved.")
 
     print("Training finished. Best Acc: {:.2f}%".format(best_acc))

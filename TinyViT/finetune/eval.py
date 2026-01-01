@@ -6,7 +6,7 @@ from datasets import load_dataset
 import time
 import torch.nn as nn
 
-from models.tiny_vit import tiny_vit_5m_224, tiny_vit_small  # TinyViT-5M 构造函数
+from models.tiny_vit import tiny_vit_5m_224, tiny_vit_small, ViTSmallBaseline  # TinyViT-5M 构造函数
 
 class HFCIFAR100(Dataset):
     """Wrap HuggingFace CIFAR-100 dataset to work with PyTorch + torchvision transforms."""
@@ -178,7 +178,8 @@ def baseline(batch_size, ckpt_path, dataset_name):
 
     # ===== 构建 TinyViT-5M 模型 =====
     # num_classes=100 对应 CIFAR-100
-    model = tiny_vit_5m_224(pretrained=True, num_classes=100)
+    # model = tiny_vit_5m_224(pretrained=True, num_classes=100)
+    model = ViTSmallBaseline()
     state_dict = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state_dict, strict=True)
     model.to(device)
@@ -252,8 +253,8 @@ def evalutation(dataset_name, batch_size, model_path):
 
 if __name__ == "__main__":
     batch_size = 256
-    baseline_path = "/scratch/xl5444/workspace/TinyVit-ECEGY9193/TinyViT/tinyvit5m_cifar100_best.pth"
-    ckpt_path = "/scratch/xl5444/workspace/TinyVit-ECEGY9193/TinyViT/finetune/student_model_cifar100_random.pth"
+    baseline_path = "/scratch/xl5444/workspace/TinyVit-ECEGY9193/TinyViT/finetune/baseline/smallvit5m_cifar100_best.pth"
+    ckpt_path = "/scratch/xl5444/workspace/TinyVit-ECEGY9193/TinyViT/finetune/baseline/smallvit5m_cifar100_best.pth"
     dataset_name = "uoft-cs/cifar100" # uoft-cs/cifar100 clane9/imagenet-100
 
     print("-"*20)
@@ -261,4 +262,4 @@ if __name__ == "__main__":
     baseline(dataset_name=dataset_name, batch_size=batch_size, ckpt_path=baseline_path)
     print("-"*20)
     print("our:")
-    evalutation(dataset_name=dataset_name, batch_size=batch_size, model_path=ckpt_path)
+    # evalutation(dataset_name=dataset_name, batch_size=batch_size, model_path=ckpt_path)
